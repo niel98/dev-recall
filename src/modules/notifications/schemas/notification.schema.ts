@@ -1,10 +1,11 @@
 import { Prop, SchemaFactory, Schema } from '@nestjs/mongoose';
 import { Types } from 'mongoose';
+import { NotificationEntity } from '../entities/notification.entity';
 
 export type NotificationDocument = Notification & Document;
 
 @Schema()
-export class Notification {
+export class Notification implements NotificationEntity {
   @Prop()
   title: string;
 
