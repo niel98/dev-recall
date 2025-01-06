@@ -1,13 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { INotificationServices } from 'src/core/abstracts/notification-services';
-import { Notification } from 'src/modules/notifications/entities/notification.entity';
+import { NotificationEntity } from 'src/modules/notifications/entities/notification.entity';
 import { Webhook, MessageBuilder } from 'discord-webhook-node';
 import { PLATFORM_NAME, GITHUB_LINK } from 'src/lib/constants';
 import { OptionalQuery } from 'src/core/types/index';
 
 @Injectable()
 export class DiscordService implements INotificationServices {
-  async inHouseNotification(notification: OptionalQuery<Notification>) {
+  async inHouseNotification(notification: OptionalQuery<NotificationEntity>) {
     // send to discord
     try {
       const hook = new Webhook(notification?.link);

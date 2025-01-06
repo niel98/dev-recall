@@ -1,4 +1,4 @@
-export class Notification {
+export class NotificationEntity {
   title: string;
   content: string;
   clicked: boolean;

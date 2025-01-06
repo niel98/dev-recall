@@ -7,7 +7,7 @@ import {
   ICreateNotification,
   IGetNotifications,
 } from './notification.type';
-import { Notification } from './entities/notification.entity';
+import { NotificationEntity } from './entities/notification.entity';
 import { DoesNotExistsException } from 'src/lib/exceptions';
 import { NotificationFactoryService } from './notification-factory.service';
 import { OptionalQuery } from 'src/core/types';
@@ -39,7 +39,7 @@ export class NotificationService {
     try {
       const { title, content, user, post, from } = payload;
 
-      const notificationPayload: OptionalQuery<Notification> = {
+      const notificationPayload: OptionalQuery<NotificationEntity> = {
         title,
         content,
         user,
@@ -51,7 +51,7 @@ export class NotificationService {
 
       const factory = this.notificationFactory.create(notificationPayload);
 
-      const data = await this.data.notification.create(factory);
+      const data = await this.data.notifications.create(factory);
 
       return {
         message: 'Notification created successfully',
@@ -71,7 +71,7 @@ export class NotificationService {
       const filterQuery = this.cleanNotificationsQuery(payload);
 
       const { data, pagination } =
-        await this.data.notification.findAllWithPagination(filterQuery, {
+        await this.data.notifications.findAllWithPagination(filterQuery, {
           populate: ['post', 'user', 'from'],
         });
 
@@ -93,13 +93,13 @@ export class NotificationService {
     try {
       const { notificationId } = payload;
 
-      const notification = await this.data.notification.findOne({
+      const notification = await this.data.notifications.findOne({
         _id: notificationId,
       });
       if (!notification)
         throw new DoesNotExistsException('Notification not found');
 
-      await this.data.notification.update(
+      await this.data.notifications.update(
         { _id: notification._id },
         { clicked: true },
       );
@@ -122,11 +122,11 @@ export class NotificationService {
       const { notificationIds } = payload;
 
       for (let i = 0; i < notificationIds.length; i++) {
-        const notification = await this.data.notification.findOne({
+        const notification = await this.data.notifications.findOne({
           _id: notificationIds[i],
         });
 
-        await this.data.notification.update(
+        await this.data.notifications.update(
           { _id: notification._id },
           { clicked: true },
         );
