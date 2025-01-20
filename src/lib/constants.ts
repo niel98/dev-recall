@@ -46,9 +46,6 @@ export type JWT_USER_PAYLOAD_TYPE = {
   emailVerified?: boolean;
   firstName?: string;
   lastName?: string;
-  status?: string;
-  role?: string;
-  transactionPin?: string;
 };
 
 export const JWT_EXPIRY_TIME: number = 5;
@@ -73,18 +70,18 @@ export enum DEVICE_TYPE {
 
 export const DEVICES = [DEVICE_TYPE.IOS, DEVICE_TYPE.ANDROID, DEVICE_TYPE.WEB];
 
-export const PLATFORM_NAME = 'twikkL';
-export const GITHUB_LINK = 'https://github.com/JiggyDevs/twikkl-api.git';
+export const PLATFORM_NAME = 'dev-recall';
+export const GITHUB_LINK = 'https://github.com/niel98/dev-recall.git';
 
 export enum RedisPrefix {
-  signupEmailCode = 'twikkL/signUpEmailCode',
-  signupPhoneCode = 'twikkL/signUpPhoneCode',
-  passwordResetCount = 'twikkL/passwordResetCount',
-  resetCode = 'twikkL/resetCode',
-  resetpassword = 'twikkL/resetPassword',
-  changeEmailResetCount = 'twikkL/changeEmailResetCount',
-  emailResetCode = 'twikkL/emailResetCode',
-  adminInviteCode = 'twikkL/adminInviteCode',
+  signupEmailCode = 'dev-recall/signUpEmailCode',
+  signupPhoneCode = 'dev-recall/signUpPhoneCode',
+  passwordResetCount = 'dev-recall/passwordResetCount',
+  resetCode = 'dev-recall/resetCode',
+  resetpassword = 'dev-recall/resetPassword',
+  changeEmailResetCount = 'dev-recall/changeEmailResetCount',
+  emailResetCode = 'dev-recall/emailResetCode',
+  adminInviteCode = 'dev-recall/adminInviteCode',
 }
 
 export const RESET_PASSWORD_EXPIRY = 600;

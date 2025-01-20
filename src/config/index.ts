@@ -1,3 +1,5 @@
+import { LogLevel } from '@nestjs/common';
+
 require('dotenv').config();
 
 function getEnv(variable: string, optional: boolean = false) {
@@ -16,6 +18,11 @@ function getEnv(variable: string, optional: boolean = false) {
   return process.env[variable]?.replace(/\\n/gm, '\n');
 }
 
+export const LOGS_LEVEL = (): LogLevel[] => {
+  if (env.isProd) return ['log', 'warn', 'error'];
+  return ['error', 'warn', 'log', 'verbose', 'debug'];
+};
+
 //environments
 export const env = {
   isDev: String(process.env.NODE_ENV).toLowerCase().includes('dev'),
@@ -28,3 +35,11 @@ export const env = {
 export const PORT = getEnv('PORT')!;
 export const MONGO_DB_URL = getEnv('MONGO_DB_URL')!;
 export const JWT_SECRET_KEY = getEnv('JWT_SECRET_KEY')!;
+export const REDIS_CLIENT_NAME = getEnv('REDIS_CLIENT_NAME');
+export const REDIS_HOST = getEnv('REDIS_HOST');
+export const REDIS_PASSWORD = getEnv('REDIS_PASSWORD');
+export const REDIS_PORT = getEnv('REDIS_PORT');
+export const DISCORD_VERIFICATION_CHANNEL_LINK = getEnv(
+  'DISCORD_VERIFICATION_CHANNEL_LINK',
+  true,
+);

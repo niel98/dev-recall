@@ -1,0 +1,810 @@
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { IDataServices } from 'src/core/abstracts';
+import {
+  ICreateUsername,
+  IIssueEmailOtpCode,
+  ILogin,
+  IRecoverPassword,
+  IResetPassword,
+  ISignUp,
+  IVerifyEmail,
+} from './auth.type';
+import {
+  AlreadyExistsException,
+  BadRequestsException,
+  DoesNotExistsException,
+  TooManyRequestsException,
+} from 'src/lib/exceptions';
+import {
+  compareHash,
+  hash,
+  isEmpty,
+  maybePluralize,
+  randomFixedInteger,
+  secondsToDhms,
+} from 'src/lib/utils';
+import { OptionalQuery } from 'src/core/types';
+import { UserEntity } from '../users/entities/users.entity';
+import { UserFactoryService } from '../users/user-factory.service';
+import {
+  INCOMPLETE_AUTH_TOKEN_VALID_TIME,
+  JWT_USER_PAYLOAD_TYPE,
+  RedisPrefix,
+  RESET_PASSWORD_EXPIRY,
+  SIGNUP_CODE_EXPIRY,
+} from 'src/lib/constants';
+import jwtLib from 'src/lib/jwtLib';
+import { IInMemoryServices } from 'src/core/abstracts/in-memory.abstract';
+import { DISCORD_VERIFICATION_CHANNEL_LINK, env } from 'src/config';
+import { DiscordService } from 'src/framework/notification-services/discord/discord.service';
+import { randomBytes } from 'crypto';
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly data: IDataServices,
+    private readonly userFactory: UserFactoryService,
+    private readonly inMemoryServices: IInMemoryServices,
+    private readonly discordServices: DiscordService,
+  ) {}
+
+  async signUp(payload: ISignUp) {
+    try {
+      const { email, password, firstName, lastName, middleName, res } = payload;
+
+      const emailExists = await this.data.users.findOne({ email });
+      if (emailExists) {
+        throw new AlreadyExistsException('Invalid email/password');
+      }
+
+      const hashedPassword = await hash(password);
+
+      const userPayload: OptionalQuery<UserEntity> = {
+        email,
+        password: hashedPassword,
+        firstName,
+        lastName,
+        middleName: middleName ?? null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const userFactory = this.userFactory.create(userPayload);
+      const user = await this.data.users.create(userFactory);
+
+      const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+        _id: user?._id,
+        email: user?.email,
+        username: user.username,
+        emailVerified: user?.emailVerified,
+      };
+
+      const token = (await jwtLib.jwtSign(
+        jwtPayload,
+        `${INCOMPLETE_AUTH_TOKEN_VALID_TIME}h`,
+      )) as string;
+      res.set('Authorization', `Bearer ${token}`);
+
+      return {
+        message: 'User signed up successfully',
+        token: `Bearer ${token}`,
+        data: jwtPayload,
+        status: HttpStatus.CREATED,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async issueEmailOtpCode(payload: IIssueEmailOtpCode) {
+    try {
+      const { req } = payload;
+
+      const authUser = req.user;
+      if (!authUser) {
+        throw new BadRequestsException('Invalid user');
+      }
+      if (authUser?.emailVerified) {
+        throw new AlreadyExistsException('user email already verified');
+      }
+
+      const redisKey = `${RedisPrefix.signupEmailCode}/${authUser?.email}`;
+      const codeSent = (await this.inMemoryServices.get(redisKey)) as number;
+
+      if (codeSent) {
+        const codeExpiry =
+          ((await this.inMemoryServices.ttl(redisKey)) as Number) || 0;
+        // taking away 4 minutes from the wait time
+        const nextRequest = Math.abs(Number(codeExpiry) / 60 - 4);
+        if (Number(codeExpiry && Number(codeExpiry) > 4)) {
+          return {
+            status: 202,
+            message: `if you have not received the verification code, please make another request in ${Math.ceil(
+              nextRequest,
+            )} ${maybePluralize(Math.ceil(nextRequest), 'minute', 's')}`,
+          };
+        }
+      }
+
+      const emailCode = randomFixedInteger(6);
+      // Remove email code for this user
+      await this.inMemoryServices.del(redisKey);
+      const user = await this.data.users.findOne({ email: authUser?.email });
+      const verification: string[] = [];
+      if (user?.emailVerified! === false) verification.push('email');
+
+      if (!user) {
+        throw new DoesNotExistsException('User does not exists');
+      }
+
+      // hash verification code in redis
+      const hashedCode = await hash(String(emailCode));
+      // save hashed code to redis
+      await this.inMemoryServices.add(
+        redisKey,
+        hashedCode,
+        // String(SIGNUP_CODE_EXPIRY),
+      );
+
+      const message = `Verification code for ${user?.email} is ${emailCode}`;
+
+      //Send to Discord
+      await this.discordServices.inHouseNotification({
+        title: `Email Verification code :- ${env.env} environment`,
+        content: message,
+        link: DISCORD_VERIFICATION_CHANNEL_LINK,
+      });
+
+      //Send to Email
+      // const emailPayload = {
+      //   from: 'support@twikkl.com',
+      //   to: user?.email,
+      //   subject: 'Email Verification Code',
+      //   body: message,
+      // };
+      // this.event.emit('send.plunkEmail', emailPayload);
+
+      return {
+        status: HttpStatus.OK,
+        message,
+        data: env.isProd ? null : emailCode,
+        verification,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async verifyEmail(payload: IVerifyEmail) {
+    try {
+      const { code, req, res } = payload;
+
+      const authUser = req?.user;
+
+      const redisKey = `${RedisPrefix.signupEmailCode}/${authUser?.email}`;
+      const verification: string[] = [];
+
+      if (authUser?.emailVerified) {
+        throw new AlreadyExistsException('user email already verified');
+      }
+
+      const savedCode = await this.inMemoryServices.get(redisKey);
+
+      if (isEmpty(savedCode)) {
+        throw new BadRequestsException('Invalid verification code');
+      }
+
+      const correctCode = await compareHash(
+        String(code).trim(),
+        (savedCode || '').trim(),
+      );
+      if (!correctCode) {
+        throw new BadRequestsException(
+          'Code is incorrect, invalid or has expired',
+        );
+      }
+
+      const updatedUser = await this.data.users.update(
+        { _id: authUser?._id },
+        {
+          $set: {
+            emailVerified: true,
+            lastLoginDate: new Date(),
+          },
+        },
+      );
+
+      const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+        _id: updatedUser?._id,
+        username: updatedUser?.firstName,
+        email: updatedUser?.email,
+        emailVerified: updatedUser.emailVerified,
+      };
+
+      if (updatedUser?.emailVerified! === false) verification.push('email');
+
+      const token = (await jwtLib.jwtSign(jwtPayload)) as string;
+      if (!res.headersSent) res.set('Authorization', `Bearer ${token}`);
+
+      await await this.inMemoryServices.del(redisKey);
+
+      return {
+        status: HttpStatus.OK,
+        message: 'User email verified successfully',
+        token: `Bearer ${token}`,
+        data: jwtPayload,
+        verification,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async createUserName(payload: ICreateUsername) {
+    try {
+      const { req, username } = payload;
+
+      const authUser = req?.user;
+      if (!authUser) throw new DoesNotExistsException('User does not exist');
+
+      if (!authUser.emailVerified)
+        throw new BadRequestsException('Email not verified');
+
+      const usernameExists = await this.data.users.findOne({ username });
+      if (usernameExists)
+        throw new AlreadyExistsException('Username already in use');
+
+      await this.data.users.update(
+        { _id: authUser._id },
+        {
+          $set: {
+            username,
+          },
+        },
+      );
+
+      return {
+        status: HttpStatus.OK,
+        message: 'Username created successfully',
+        data: {},
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async login(payload: ILogin) {
+    try {
+      const { email, password, deviceToken, res } = payload;
+
+      const emailExists = await this.data.users.findOne({ email });
+      if (!emailExists)
+        throw new DoesNotExistsException('Invalid email or password');
+
+      const verification: string[] = [];
+
+      if (!emailExists?.emailVerified) {
+        verification.push('email');
+        const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+          _id: emailExists?._id,
+          username: emailExists?.firstName,
+          email: emailExists?.email,
+          emailVerified: emailExists.emailVerified,
+        };
+
+        const token = await jwtLib.jwtSign(
+          jwtPayload,
+          `${INCOMPLETE_AUTH_TOKEN_VALID_TIME}h`,
+        );
+        return {
+          status: 403,
+          message: 'email is not verified',
+          token: `Bearer ${token}`,
+          verification,
+        };
+      }
+
+      const validPassword: boolean = await compareHash(
+        password,
+        emailExists?.password,
+      );
+      if (!validPassword)
+        throw new BadRequestException('Invalid email or password');
+
+      const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+        _id: emailExists?._id,
+        email: emailExists.email,
+        username: emailExists.username,
+        emailVerified: emailExists.emailVerified,
+      };
+
+      const token = await jwtLib.jwtSign(jwtPayload);
+      res.set('Authorization', `Bearer ${token}`);
+
+      await this.data.users.update(
+        { _id: emailExists._id },
+        { $set: { lastLoginDate: new Date() } },
+      );
+
+      if (deviceToken) {
+        await this.data.users.update(
+          { _id: emailExists._id },
+          { $set: { deviceToken } },
+        );
+      }
+
+      return {
+        status: HttpStatus.OK,
+        message: 'User logged in successfully',
+        token: `Bearer ${token}`,
+        data: jwtPayload,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async authUser(userId: string) {
+    try {
+      const user = await this.data.users.findOne({ _id: userId }, null, {
+        select: ['-password'],
+      });
+
+      if (!user) throw new NotFoundException('User not found');
+
+      return {
+        status: HttpStatus.OK,
+        message: 'User retrieved successfully',
+        data: user,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async recoverPassword(payload: IRecoverPassword) {
+    try {
+      const { email, code } = payload;
+      const passwordResetCountKey = `${RedisPrefix.passwordResetCount}/${email}`;
+      const resetPasswordRedisKey = `${RedisPrefix.resetpassword}/${email}`;
+      const resetCodeRedisKey = `${RedisPrefix.resetCode}/${email}`;
+
+      const resetInPast24H = await this.inMemoryServices.get(
+        passwordResetCountKey,
+      );
+      if (resetInPast24H) {
+        const ttl = await this.inMemoryServices.ttl(passwordResetCountKey);
+        const timeToRetry = Math.ceil(Number(ttl));
+        const nextTryOpening = secondsToDhms(timeToRetry);
+        throw new TooManyRequestsException(
+          `Password was recently updated. Try again in ${nextTryOpening}`,
+        );
+      }
+
+      const user = await this.data.users.findOne({ email });
+      if (!user) {
+        throw new BadRequestsException(`Invalid email address`);
+      }
+
+      const codeSent = await this.inMemoryServices.get(resetPasswordRedisKey);
+      if (!code) {
+        if (codeSent) {
+          const codeExpiry =
+            ((await this.inMemoryServices.ttl(resetCodeRedisKey)) as Number) ||
+            0;
+          return {
+            status: 202,
+            message: `Provide the code sent to your email or request another one in ${Math.ceil(
+              Number(codeExpiry) / 60,
+            )} minute`,
+            nextRequestInSecs: Number(codeExpiry),
+          };
+        }
+
+        try {
+          const phoneCode = randomFixedInteger(6);
+          const hashedPhoneCode = await hash(String(phoneCode));
+
+          await this.inMemoryServices.del(resetCodeRedisKey);
+
+          await this.inMemoryServices.add(
+            resetPasswordRedisKey,
+            hashedPhoneCode,
+          );
+
+          //Send to discord
+          await this.discordServices.inHouseNotification({
+            title: `Forgot password otp code :- ${env.env} environment`,
+            content: `Provide the code sent to your email address \n code: ${phoneCode}`,
+            link: DISCORD_VERIFICATION_CHANNEL_LINK,
+          });
+
+          //Send to Email
+          // const emailPayload = {
+          //   from: 'support@twikkl.com',
+          //   to: user?.email,
+          //   subject: 'Email Verification Code',
+          //   body: `Provide the code sent to your mobile number/email \n code: ${phoneCode}`,
+          // };
+          // this.event.emit('send.plunkEmail', emailPayload);
+
+          return {
+            status: 202,
+            message: 'Provide the code sent to your email address',
+            code: env.isProd ? null : phoneCode,
+          };
+        } catch (error) {
+          if (error.name === 'TypeError') {
+            throw new HttpException(error.message, 500);
+          }
+          Logger.error(error);
+          throw error;
+        }
+      } else {
+        const phoneVerifyDocument = codeSent as string;
+        if (isEmpty(phoneVerifyDocument)) {
+          throw new BadRequestsException(`code is invalid or has expired`);
+        }
+        const correctCode = await compareHash(
+          String(code).trim(),
+          (phoneVerifyDocument || '').trim(),
+        );
+        if (!correctCode) {
+          throw new BadRequestsException(`code is invalid or has expired`);
+        }
+
+        // Generate Reset token
+        const resetToken = randomBytes(32).toString('hex');
+        const hashedResetToken = await hash(resetToken);
+
+        // Remove all reset token for this user if it exists
+        await this.inMemoryServices.del(resetCodeRedisKey);
+        await this.inMemoryServices.del(resetPasswordRedisKey);
+
+        await this.inMemoryServices.add(
+          resetPasswordRedisKey,
+          hashedResetToken,
+          // String(RESET_PASSWORD_EXPIRY),
+        );
+
+        await this.discordServices.inHouseNotification({
+          title: `Recover password token :- ${env.env} environment`,
+          content: `You will receive an email with a link to reset your password if you have an account with this email \n token: ${resetToken}`,
+          link: DISCORD_VERIFICATION_CHANNEL_LINK,
+        });
+
+        return {
+          status: 200,
+          message:
+            'You will receive an email with a link to reset your password if you have an account with this email.',
+          resetSecret: env.isProd ? null : resetToken,
+          resetToken: env.isProd ? null : resetToken,
+        };
+      }
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  async resetpassword(payload: IResetPassword) {
+    try {
+      const { email, password, code, res } = payload;
+      const passwordResetCountKey = `${RedisPrefix.passwordResetCount}/${email}`;
+      const resetPasswordRedisKey = `${RedisPrefix.resetpassword}/${email}`;
+      const resetCodeRedisKey = `${RedisPrefix.resetCode}/${email}`;
+
+      const resetInPast24H = await this.inMemoryServices.get(
+        passwordResetCountKey,
+      );
+
+      const userRequestReset = await this.inMemoryServices.get(
+        resetPasswordRedisKey,
+      );
+
+      if (!userRequestReset)
+        throw new BadRequestsException('Invalid or expired reset token');
+
+      if (resetInPast24H) {
+        const ttl = await this.inMemoryServices.ttl(passwordResetCountKey);
+        const timeToRetry = Math.ceil(Number(ttl));
+        const nextTryOpening = secondsToDhms(timeToRetry);
+        throw new TooManyRequestsException(
+          `Password was recently updated. Try again in ${nextTryOpening}`,
+        );
+      }
+
+      const user = await this.data.users.findOne({ email });
+      if (!user) throw new DoesNotExistsException('user does not exists');
+
+      const phoneVerifyDocument = userRequestReset as string;
+      if (isEmpty(phoneVerifyDocument)) {
+        throw new BadRequestsException(`code is invalid or has expired`);
+      }
+      const correctCode = await compareHash(
+        String(code).trim(),
+        (phoneVerifyDocument || '').trim(),
+      );
+      if (!correctCode) {
+        throw new BadRequestsException(`code is invalid or has expired`);
+      }
+
+      // Remove all reset token for this user if it exists
+      await this.inMemoryServices.del(resetCodeRedisKey);
+
+      // If reset link is valid and not expired
+      // const validReset = await compareHash(String(token), userRequestReset);
+      // if (!validReset)
+      //   throw new BadRequestsException('Invalid or expired reset token');
+
+      const hashedPassword = await hash(password);
+      const twenty4H = 1 * 60 * 60 * 24;
+
+      // Remove reset token for this user
+      await this.inMemoryServices.del(resetPasswordRedisKey);
+      await this.inMemoryServices.add(
+        passwordResetCountKey,
+        1,
+        String(twenty4H),
+      );
+
+      // save reset count for next 24 hours
+      // remove stored cookie so it reinstate otp
+      res.cookie('deviceTag', '');
+      await this.data.users.update(
+        { email: user.email },
+        {
+          $set: {
+            password: hashedPassword,
+          },
+        },
+      );
+
+      return {
+        status: 200,
+        message: 'Password updated successfully',
+        data: null,
+      };
+    } catch (error) {
+      Logger.error(error);
+      if (error.name === 'TypeError')
+        throw new HttpException(error.message, 500);
+      throw error;
+    }
+  }
+
+  // async googleSignUp(payload: IGoogleAuthPayload) {
+  //   try {
+  //     const { token, res } = payload;
+
+  //     // Verify the Google token
+  //     const ticket = await this.googleAuthClient.verifyIdToken({
+  //       idToken: token,
+  //       audience: env.GOOGLE_CLIENT_ID,
+  //     });
+
+  //     const { email, given_name, family_name, email_verified } = ticket.getPayload();
+
+  //     // Check if user already exists
+  //     const existingUser = await this.data.users.findOne({ email });
+  //     if (existingUser) {
+  //       throw new AlreadyExistsException('User already exists with this email');
+  //     }
+
+  //     // Create new user
+  //     const userPayload: OptionalQuery<UserEntity> = {
+  //       email,
+  //       firstName: given_name,
+  //       lastName: family_name,
+  //       emailVerified: email_verified,
+  //       authProvider: 'google',
+  //       createdAt: new Date(),
+  //       updatedAt: new Date(),
+  //     };
+
+  //     const userFactory = this.userFactory.create(userPayload);
+  //     const user = await this.data.users.create(userFactory);
+
+  //     const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+  //       _id: user?._id,
+  //       email: user?.email,
+  //       username: user.username,
+  //       emailVerified: user?.emailVerified,
+  //     };
+
+  //     const jwtToken = await jwtLib.jwtSign(jwtPayload);
+  //     res.set('Authorization', `Bearer ${jwtToken}`);
+
+  //     return {
+  //       status: HttpStatus.CREATED,
+  //       message: 'User signed up successfully with Google',
+  //       token: `Bearer ${jwtToken}`,
+  //       data: jwtPayload,
+  //     };
+
+  //   } catch (error) {
+  //     Logger.error(error);
+  //     if (error.name === 'TypeError')
+  //       throw new HttpException(error.message, 500);
+  //     throw error;
+  //   }
+  // }
+
+  // async appleSignup(payload: IAppleSignup) {
+  //   try {
+  //     const { idToken, res } = payload;
+
+  //     // Verify Apple ID token
+  //     const appleClient = new AppleAuth({
+  //       clientId: env.APPLE_CLIENT_ID,
+  //       teamId: env.APPLE_TEAM_ID,
+  //       keyId: env.APPLE_KEY_ID,
+  //       privateKey: env.APPLE_PRIVATE_KEY,
+  //     });
+
+  //     const ticket = await appleClient.verifyIdToken(idToken);
+
+  //     const { email, given_name, family_name, email_verified } = ticket;
+
+  //     // Check if user already exists
+  //     const existingUser = await this.data.users.findOne({ email });
+  //     if (existingUser) {
+  //       throw new AlreadyExistsException('User already exists with this email');
+  //     }
+
+  //     // Create new user
+  //     const userPayload: OptionalQuery<UserEntity> = {
+  //       email,
+  //       firstName: given_name,
+  //       lastName: family_name,
+  //       emailVerified: email_verified,
+  //       authProvider: 'apple',
+  //       createdAt: new Date(),
+  //       updatedAt: new Date(),
+  //     };
+
+  //     const userFactory = this.userFactory.create(userPayload);
+  //     const user = await this.data.users.create(userFactory);
+
+  //     const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+  //       _id: user?._id,
+  //       email: user?.email,
+  //       username: user.username,
+  //       emailVerified: user?.emailVerified,
+  //     };
+
+  //     const jwtToken = await jwtLib.jwtSign(jwtPayload);
+  //     res.set('Authorization', `Bearer ${jwtToken}`);
+
+  //     return {
+  //       status: HttpStatus.CREATED,
+  //       message: 'User signed up successfully with Apple',
+  //       token: `Bearer ${jwtToken}`,
+  //       data: jwtPayload,
+  //     };
+
+  //   } catch (error) {
+  //     Logger.error(error);
+  //     if (error.name === 'TypeError')
+  //       throw new HttpException(error.message, 500);
+  //     throw error;
+  //   }
+  // }
+
+  // async githubSignUp(payload: IGithubAuthPayload) {
+  //   try {
+  //     const { code, res } = payload;
+
+  //     // Exchange code for access token
+  //     const tokenResponse = await fetch('https://github.com/login/oauth/access_token', {
+  //       method: 'POST',
+  //       headers: {
+  //         'Content-Type': 'application/json',
+  //         Accept: 'application/json',
+  //       },
+  //       body: JSON.stringify({
+  //         client_id: env.GITHUB_CLIENT_ID,
+  //         client_secret: env.GITHUB_CLIENT_SECRET,
+  //         code,
+  //       }),
+  //     });
+
+  //     const tokenData = await tokenResponse.json();
+  //     const accessToken = tokenData.access_token;
+
+  //     // Get user data from GitHub
+  //     const userResponse = await fetch('https://api.github.com/user', {
+  //       headers: {
+  //         Authorization: `Bearer ${accessToken}`,
+  //       },
+  //     });
+
+  //     const githubUser = await userResponse.json();
+
+  //     // Get user email from GitHub
+  //     const emailsResponse = await fetch('https://api.github.com/user/emails', {
+  //       headers: {
+  //         Authorization: `Bearer ${accessToken}`,
+  //       },
+  //     });
+
+  //     const emails = await emailsResponse.json();
+  //     const primaryEmail = emails.find((email: any) => email.primary)?.email;
+
+  //     if (!primaryEmail) {
+  //       throw new BadRequestsException('No primary email found on GitHub account');
+  //     }
+
+  //     // Check if user already exists
+  //     const existingUser = await this.data.users.findOne({ email: primaryEmail });
+  //     if (existingUser) {
+  //       throw new AlreadyExistsException('User already exists with this email');
+  //     }
+
+  //     // Create new user
+  //     const userPayload: OptionalQuery<UserEntity> = {
+  //       email: primaryEmail,
+  //       firstName: githubUser.name ? githubUser.name.split(' ')[0] : null,
+  //       lastName: githubUser.name ? githubUser.name.split(' ').slice(1).join(' ') : null,
+  //       username: githubUser.login,
+  //       emailVerified: true,
+  //       authProvider: 'github',
+  //       createdAt: new Date(),
+  //       updatedAt: new Date(),
+  //     };
+
+  //     const userFactory = this.userFactory.create(userPayload);
+  //     const user = await this.data.users.create(userFactory);
+
+  //     const jwtPayload: JWT_USER_PAYLOAD_TYPE = {
+  //       _id: user?._id,
+  //       email: user?.email,
+  //       username: user.username,
+  //       emailVerified: user?.emailVerified,
+  //     };
+
+  //     const token = await jwtLib.jwtSign(jwtPayload);
+  //     res.set('Authorization', `Bearer ${token}`);
+
+  //     return {
+  //       status: HttpStatus.CREATED,
+  //       message: 'User signed up successfully with GitHub',
+  //       token: `Bearer ${token}`,
+  //       data: jwtPayload,
+  //     };
+
+  //   } catch (error) {
+  //     Logger.error(error);
+  //     if (error.name === 'TypeError')
+  //       throw new HttpException(error.message, 500);
+  //     throw error;
+  //   }
+  // }
+}
