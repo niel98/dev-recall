@@ -6,6 +6,12 @@ export type UserDocument = User & Document;
 
 @Schema()
 export class User implements UserEntity {
+  @Prop({ isRequired: true, unique: true })
+  email: string;
+
+  @Prop({ isRequired: true })
+  password: string;
+
   @Prop()
   firstName: string;
 
@@ -26,6 +32,12 @@ export class User implements UserEntity {
 
   @Prop({ required: false })
   avatar: string;
+
+  @Prop({ isRequired: false })
+  lastLoginDate: Date;
+
+  @Prop({ isRequired: false, default: false })
+  emailVerified: boolean;
 
   @Prop()
   createdAt: Date;
